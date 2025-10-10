@@ -1,0 +1,104 @@
+# Sample Inference Configuration with Auto-Slicing
+# This config demonstrates how to automatically slice large meshes before inference
+
+model:
+  feature_dim: 128
+  embedding_dim: 256
+  num_heads: 8
+  num_attention_blocks: 6
+  n_classes: 5
+  n_clusters: 1000
+  clusters_per_batch: 300
+  batch_size: 1
+  use_pe: true
+  dropout: 0.1
+  ignore_index: null  # Set to integer if you want to ignore a specific class
+  include_normals: true
+  additional_geometrical_features: false
+  use_hierarchical: false
+  fourier: false
+  relative_positional_encoding: false
+  
+  # Texture configuration (optional)
+  use_texture: false
+  texture_patch_size: 16
+  texture_embed_dim: 64
+  fusion_method: 'gated'
+  max_texture_pixels: 128
+
+paths:
+  # Main mesh directory - this is where your large mesh files are located
+  test_mesh_dir: '/path/to/your/large/meshes'
+  
+  # Optional: label directory if you want to evaluate with ground truth
+  test_label_dir: null  # Set to path if you have labels, otherwise null
+  
+  # Optional: JSON directory for additional metadata
+  test_json_dir: null
+  
+  # Optional: Texture directory if using texture features
+  test_texture_dir: null
+  
+  # Checkpoint path - trained model to use for inference
+  checkpoint_path: '/path/to/your/checkpoint.pth'
+  
+  # Output directory for predictions
+  output_dir: '/path/to/output/predictions'
+  
+  # Whether to save predicted meshes with labels
+  save_meshes: true
+  
+  # Whether labels are available (true for evaluation, false for pure inference)
+  has_labels: false
+
+# Auto-Slicing Configuration
+# This is the new feature that automatically slices large meshes
+auto_slice:
+  # Enable or disable auto-slicing
+  enabled: true
+  
+  # Where to save sliced meshes
+  # If not specified, creates 'sliced_meshes' directory next to test_mesh_dir
+  output_dir: '/path/to/sliced/meshes'  # Optional, defaults to ../sliced_meshes
+  
+  # Whether to reuse existing slices if they exist (faster)
+  # Set to false to force re-slicing
+  reuse_existing_slices: true
+  
+  # Slicing mode: 'grid' or 'adaptive'
+  # - 'grid': Divides mesh into regular grid cells
+  # - 'adaptive': Divides based on face density
+  mode: 'grid'
+  
+  # Grid-based slicing parameters (used when mode='grid')
+  # Format: [x_divisions, y_divisions, z_divisions]
+  # Example: [3, 3, 1] creates 9 slices in a 3x3x1 grid
+  grid_divisions: [3, 3, 1]
+  
+  # Adaptive slicing parameters (used when mode='adaptive')
+  target_faces_per_box: 5000  # Target number of faces per slice
+  min_boxes: 1                # Minimum number of boxes (1 = no slicing for small meshes)
+  max_boxes: 50               # Maximum number of boxes to create
+
+# Example usage scenarios:
+#
+# 1. Small grid (fast processing, larger slices):
+#    mode: 'grid'
+#    grid_divisions: [2, 2, 1]  # Creates 4 slices
+#
+# 2. Medium grid (balanced):
+#    mode: 'grid'
+#    grid_divisions: [3, 3, 1]  # Creates 9 slices
+#
+# 3. Fine grid (slower processing, smaller slices):
+#    mode: 'grid'
+#    grid_divisions: [5, 5, 2]  # Creates 50 slices
+#
+# 4. Adaptive based on mesh complexity:
+#    mode: 'adaptive'
+#    target_faces_per_box: 10000  # Larger boxes for simpler meshes
+#
+# 5. Adaptive for very complex meshes:
+#    mode: 'adaptive'
+#    target_faces_per_box: 2000   # Smaller boxes for complex meshes
+

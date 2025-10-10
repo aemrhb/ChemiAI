@@ -1,0 +1,36 @@
+# Quick Start: Inference with Auto-Slicing
+# Minimal configuration to run inference on large meshes with automatic slicing
+
+model:
+  feature_dim: 128
+  embedding_dim: 256
+  num_heads: 8
+  num_attention_blocks: 6
+  n_classes: 5
+  n_clusters: 1000
+  clusters_per_batch: 300
+  batch_size: 1
+  use_pe: true
+  dropout: 0.1
+  ignore_index: null
+  include_normals: true
+  additional_geometrical_features: false
+  use_texture: false
+
+paths:
+  test_mesh_dir: 'E:\chiminova\data\DATA_6_2025\HiDrive\LaNau-v3-projected'
+  test_label_dir: null
+  test_json_dir: null
+  test_texture_dir: null
+  checkpoint_path: '/path/to/your/checkpoint.pth'
+  output_dir: 'E:\chiminova\data\DATA_6_2025\process\mid\clean\Sout\predictions'
+  save_meshes: true
+  has_labels: false
+
+# Enable auto-slicing for large meshes
+auto_slice:
+  enabled: true                    # Turn on auto-slicing
+  mode: 'grid'                     # Use grid-based slicing
+  grid_divisions: [3, 3, 1]        # Divide into 3x3x1 = 9 slices
+  reuse_existing_slices: true      # Reuse slices if already created
+
