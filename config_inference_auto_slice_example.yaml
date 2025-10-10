@@ -30,7 +30,15 @@ paths:
 # Enable auto-slicing for large meshes
 auto_slice:
   enabled: true                    # Turn on auto-slicing
-  mode: 'grid'                     # Use grid-based slicing
-  grid_divisions: [3, 3, 1]        # Divide into 3x3x1 = 9 slices
-  reuse_existing_slices: true      # Reuse slices if already created
+  mode: 'adaptive'                 # Use adaptive slicing (default) or 'grid' for grid-based
+  
+  # Adaptive mode parameters (used when mode='adaptive'):
+  target_faces_per_box: 5000       # Target number of faces per slice
+  min_boxes: 1                     # Minimum number of slices
+  max_boxes: 50                    # Maximum number of slices
+  
+  # Grid mode parameters (only used when mode='grid'):
+  # grid_divisions: [3, 3, 1]      # Divide into 3x3x1 = 9 slices
+  
+  output_dir: null                 # Where to save sliced meshes (null = auto-generated path)
 

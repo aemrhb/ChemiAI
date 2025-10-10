@@ -5,6 +5,7 @@ import torch
 import numpy as np
 import trimesh
 import glob
+import json
 from torch.utils.data import DataLoader
 from ignite.metrics import IoU, ConfusionMatrix
 from torchmetrics import F1Score, Accuracy
@@ -24,7 +25,7 @@ from tools.auto_mesh_slicer import (
 
 
 def slice_large_mesh(mesh_path, output_dir, grid_divisions=(3, 3, 1), slicing_mode='grid', 
-                     target_faces_per_box=5000, min_boxes=4, max_boxes=50):
+                     target_faces_per_box=5000, min_boxes=4, max_boxes=50, save_mapping=True):
     """
     Slice a large mesh into smaller parts for efficient inference.
     
@@ -36,6 +37,7 @@ def slice_large_mesh(mesh_path, output_dir, grid_divisions=(3, 3, 1), slicing_mo
         target_faces_per_box: Target faces per box for adaptive mode
         min_boxes: Minimum boxes for adaptive mode
         max_boxes: Maximum boxes for adaptive mode
+        save_mapping: Whether to save mapping from slice faces to original faces
         
     Returns:
         List of paths to sliced mesh files
@@ -66,12 +68,51 @@ def slice_large_mesh(mesh_path, output_dir, grid_divisions=(3, 3, 1), slicing_mo
     
     print(f"Generated {len(bounding_boxes)} bounding boxes")
     
-    # Slice the mesh
+    # Slice the mesh with face mapping tracking
     print("\nSlicing mesh...")
-    split_meshes = slice_mesh_with_bounding_boxes(vertices, faces, bounding_boxes)
+    split_meshes = []
+    face_mappings = {}  # slice_name -> list of original face indices
+    
+    for bbox_index, bbox in enumerate(bounding_boxes):
+        x_min, x_max, y_min, y_max, z_min, z_max = bbox
+        sliced_face_indices = []  # Track which original faces go into this slice
+        sliced_faces = []
+        
+        for orig_face_idx, face_indices in enumerate(faces):
+            v0_idx, v1_idx, v2_idx = int(face_indices[0]), int(face_indices[1]), int(face_indices[2])
+            v0 = vertices[v0_idx, :3]
+            v1 = vertices[v1_idx, :3]
+            v2 = vertices[v2_idx, :3]
+
+            # Check if all vertices are inside the bounding box
+            if all(x_min <= v[0] <= x_max and y_min <= v[1] <= y_max and z_min <= v[2] <= z_max 
+                   for v in [v0, v1, v2]):
+                sliced_faces.append(face_indices)
+                sliced_face_indices.append(orig_face_idx)
+
+        if sliced_faces:
+            # Get unique vertices used by these faces
+            used_vertex_indices = set()
+            for face in sliced_faces:
+                used_vertex_indices.update(face[:3].astype(int))
+            
+            # Create mapping from old to new vertex indices
+            old_to_new = {old_idx: new_idx for new_idx, old_idx in enumerate(sorted(used_vertex_indices))}
+            
+            # Create new vertices and faces arrays
+            cleaned_vertices = vertices[sorted(used_vertex_indices)]
+            cleaned_faces = []
+            for face in sliced_faces:
+                new_face = np.array([old_to_new[int(face[0])], old_to_new[int(face[1])], old_to_new[int(face[2])]] + list(face[3:]))
+                cleaned_faces.append(new_face)
+            cleaned_faces = np.array(cleaned_faces, dtype=object)
+            
+            split_meshes.append((cleaned_vertices, cleaned_faces, bbox))
+            face_mappings[bbox_index] = sliced_face_indices
+    
     print(f"Created {len(split_meshes)} mesh slices")
     
-    # Write sliced meshes
+    # Write sliced meshes and save mappings
     print("\nWriting sliced meshes...")
     sliced_mesh_paths = []
     base_name = os.path.splitext(os.path.basename(mesh_path))[0]
@@ -84,6 +125,21 @@ def slice_large_mesh(mesh_path, output_dir, grid_divisions=(3, 3, 1), slicing_mo
         reduction_percent = 100.0 * (1 - len(slice_vertices) / len(vertices))
         print(f"  Slice {i:03d}: {len(slice_faces)} faces, {len(slice_vertices)} vertices "
               f"(reduced by {reduction_percent:.1f}%)")
+    
+    # Save mapping file if requested
+    if save_mapping:
+        mapping_path = os.path.join(output_dir, f"{base_name}_face_mapping.json")
+        mapping_data = {
+            'original_mesh': mesh_path,
+            'original_num_faces': len(faces),
+            'slices': {
+                f"{base_name}_slice_{i:03d}.ply": face_mappings[i]
+                for i in range(len(split_meshes))
+            }
+        }
+        with open(mapping_path, 'w') as f:
+            json.dump(mapping_data, f, indent=2)
+        print(f"\nSaved face mapping to: {mapping_path}")
     
     print(f"\n{'='*60}")
     print(f"Slicing complete! Created {len(sliced_mesh_paths)} slices")
@@ -135,25 +191,41 @@ def process_mesh_directory_with_slicing(mesh_dir, slice_output_dir, auto_slice_c
     print(f"\nFound {len(mesh_files)} mesh(es) to slice")
     
     # Get slicing parameters
-    slicing_mode = auto_slice_config.get('mode', 'grid')
-    grid_divisions = tuple(auto_slice_config.get('grid_divisions', [3, 3, 1]))
-    target_faces_per_box = auto_slice_config.get('target_faces_per_box', 5000)
-    min_boxes = auto_slice_config.get('min_boxes', 1)  # Changed to 1 to allow no slicing for small meshes
-    max_boxes = auto_slice_config.get('max_boxes', 50)
+    slicing_mode = auto_slice_config.get('mode', 'adaptive')  # Default to adaptive
+    
+    if slicing_mode == 'adaptive':
+        # Adaptive mode parameters
+        target_faces_per_box = auto_slice_config.get('target_faces_per_box', 30000)
+        min_boxes = auto_slice_config.get('min_boxes', 1)
+        max_boxes = auto_slice_config.get('max_boxes', 50)
+        grid_divisions = None  # Not used in adaptive mode
+    else:
+        # Grid mode parameters
+        grid_divisions = tuple(auto_slice_config.get('grid_divisions', [3, 3, 1]))
+        target_faces_per_box = None  # Not used in grid mode
+        min_boxes = None
+        max_boxes = None
     
     # Slice each mesh
     all_sliced_paths = []
     for mesh_path in mesh_files:
         try:
-            sliced_paths = slice_large_mesh(
-                mesh_path=mesh_path,
-                output_dir=slice_output_dir,
-                grid_divisions=grid_divisions,
-                slicing_mode=slicing_mode,
-                target_faces_per_box=target_faces_per_box,
-                min_boxes=min_boxes,
-                max_boxes=max_boxes
-            )
+            if slicing_mode == 'adaptive':
+                sliced_paths = slice_large_mesh(
+                    mesh_path=mesh_path,
+                    output_dir=slice_output_dir,
+                    slicing_mode=slicing_mode,
+                    target_faces_per_box=target_faces_per_box,
+                    min_boxes=min_boxes,
+                    max_boxes=max_boxes
+                )
+            else:  # grid mode
+                sliced_paths = slice_large_mesh(
+                    mesh_path=mesh_path,
+                    output_dir=slice_output_dir,
+                    grid_divisions=grid_divisions,
+                    slicing_mode=slicing_mode
+                )
             all_sliced_paths.extend(sliced_paths)
         except Exception as e:
             print(f"Error slicing {mesh_path}: {e}")
@@ -292,6 +364,162 @@ def save_mesh_with_predictions(mesh_path: str, predictions: np.ndarray, output_p
         
     except Exception as e:
         print(f"Error saving mesh {mesh_path}: {e}")
+
+
+def stitch_sliced_predictions(slice_predictions_dir, original_mesh_dir, output_dir, sliced_mesh_dir):
+    """
+    Stitch together predictions from sliced meshes back to original meshes.
+    
+    Args:
+        slice_predictions_dir: Directory containing predicted sliced meshes
+        original_mesh_dir: Directory containing original (pre-sliced) meshes
+        output_dir: Directory to save stitched meshes
+        sliced_mesh_dir: Directory containing sliced meshes and mapping files
+    """
+    print("\n" + "="*60)
+    print("Stitching sliced predictions back to original meshes...")
+    print("="*60)
+    
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Find all mapping files
+    mapping_files = glob.glob(os.path.join(sliced_mesh_dir, "*_face_mapping.json"))
+    
+    if not mapping_files:
+        print("Warning: No face mapping files found. Cannot stitch predictions.")
+        print(f"Looked in: {sliced_mesh_dir}")
+        return
+    
+    print(f"Found {len(mapping_files)} mapping file(s)")
+    
+    for mapping_file in mapping_files:
+        try:
+            # Load mapping
+            with open(mapping_file, 'r') as f:
+                mapping_data = json.load(f)
+            
+            original_mesh_path = mapping_data['original_mesh']
+            original_num_faces = mapping_data['original_num_faces']
+            slice_mappings = mapping_data['slices']
+            
+            original_basename = os.path.splitext(os.path.basename(original_mesh_path))[0]
+            print(f"\nProcessing: {original_basename}")
+            print(f"  Original faces: {original_num_faces}")
+            print(f"  Number of slices: {len(slice_mappings)}")
+            
+            # Initialize array for all face predictions
+            all_face_predictions = np.zeros(original_num_faces, dtype=np.int32)
+            face_prediction_counts = np.zeros(original_num_faces, dtype=np.int32)  # Track how many times each face was predicted
+            
+            # Collect predictions from all slices
+            for slice_name, original_face_indices in slice_mappings.items():
+                # Find the predicted slice mesh
+                slice_basename = os.path.splitext(slice_name)[0]
+                predicted_slice_path = os.path.join(slice_predictions_dir, f"{slice_basename}_predicted.ply")
+                
+                if not os.path.exists(predicted_slice_path):
+                    print(f"  Warning: Predicted slice not found: {predicted_slice_path}")
+                    continue
+                
+                # Load the predicted slice
+                try:
+                    slice_mesh = trimesh.load(predicted_slice_path, force='mesh')
+                    
+                    # Extract face labels from the mesh
+                    # Assuming the face labels are stored in the 'cls' property
+                    if hasattr(slice_mesh, 'face_attributes') and 'label' in slice_mesh.face_attributes:
+                        slice_predictions = slice_mesh.face_attributes['label']
+                    elif hasattr(slice_mesh, 'metadata') and 'face_labels' in slice_mesh.metadata:
+                        slice_predictions = slice_mesh.metadata['face_labels']
+                    else:
+                        # Try to read from PLY file directly
+                        slice_predictions = read_face_labels_from_ply(predicted_slice_path)
+                    
+                    if slice_predictions is None:
+                        print(f"  Warning: Could not extract labels from {slice_basename}")
+                        continue
+                    
+                    # Map predictions back to original face indices
+                    for slice_face_idx, orig_face_idx in enumerate(original_face_indices):
+                        if slice_face_idx < len(slice_predictions):
+                            all_face_predictions[orig_face_idx] += slice_predictions[slice_face_idx]
+                            face_prediction_counts[orig_face_idx] += 1
+                    
+                    print(f"  Processed slice: {slice_basename} ({len(original_face_indices)} faces)")
+                    
+                except Exception as e:
+                    print(f"  Error processing slice {slice_basename}: {e}")
+                    continue
+            
+            # Average predictions for faces that appear in multiple slices (if any overlap)
+            for i in range(original_num_faces):
+                if face_prediction_counts[i] > 1:
+                    all_face_predictions[i] = int(all_face_predictions[i] / face_prediction_counts[i] + 0.5)
+            
+            # Load original mesh and save with stitched predictions
+            original_mesh_path_full = os.path.join(original_mesh_dir, os.path.basename(original_mesh_path))
+            if not os.path.exists(original_mesh_path_full):
+                original_mesh_path_full = original_mesh_path  # Try the path from mapping file
+            
+            if os.path.exists(original_mesh_path_full):
+                output_path = os.path.join(output_dir, f"{original_basename}_stitched.ply")
+                save_mesh_with_predictions(original_mesh_path_full, all_face_predictions, output_path)
+                print(f"  Saved stitched mesh: {output_path}")
+            else:
+                print(f"  Warning: Original mesh not found: {original_mesh_path_full}")
+                
+        except Exception as e:
+            print(f"Error processing mapping file {mapping_file}: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    print("\n" + "="*60)
+    print("Stitching complete!")
+    print(f"Stitched meshes saved to: {output_dir}")
+    print("="*60 + "\n")
+
+
+def read_face_labels_from_ply(ply_path):
+    """
+    Read face labels directly from a PLY file.
+    
+    Args:
+        ply_path: Path to PLY file
+        
+    Returns:
+        numpy array of face labels, or None if not found
+    """
+    try:
+        face_labels = []
+        reading_faces = False
+        face_count = 0
+        
+        with open(ply_path, 'r') as f:
+            for line in f:
+                if line.startswith('element face'):
+                    face_count = int(line.split()[2])
+                elif line.startswith('end_header'):
+                    reading_faces = True
+                    continue
+                elif reading_faces and face_count > 0:
+                    parts = line.strip().split()
+                    # The label should be the last integer in the face line
+                    # Format: "3 v0 v1 v2 ... label"
+                    if len(parts) > 4:
+                        try:
+                            label = int(parts[-1])  # Last element is usually the label
+                            face_labels.append(label)
+                        except:
+                            # If last element isn't an int, try to find 'label' property
+                            pass
+                    face_count -= 1
+                    if face_count == 0:
+                        break
+        
+        return np.array(face_labels) if face_labels else None
+    except Exception as e:
+        print(f"Error reading face labels from {ply_path}: {e}")
+        return None
 
 
 def build_model_from_config(config, device, use_texture=False):
@@ -577,6 +805,7 @@ def main():
             print(f"Removed {len(sliced_files)} sliced mesh files from {slice_output_dir}")
             print("="*60 + "\n")
         
+        
         # Process meshes with slicing
         test_mesh_dir = process_mesh_directory_with_slicing(
             mesh_dir=test_mesh_dir,
@@ -696,6 +925,18 @@ def main():
         print(f"Generated predictions for {len(predictions)} batches")
         if output_dir:
             print(f"Predictions saved to: {output_dir}")
+        
+        # If auto-slicing was used, stitch predictions back to original meshes
+        if auto_slice_enabled and save_meshes and output_dir:
+            slice_predictions_dir = os.path.join(output_dir, "predicted_meshes")
+            stitched_output_dir = os.path.join(output_dir, "stitched_meshes")
+            
+            stitch_sliced_predictions(
+                slice_predictions_dir=slice_predictions_dir,
+                original_mesh_dir=original_mesh_dir,
+                output_dir=stitched_output_dir,
+                sliced_mesh_dir=test_mesh_dir  # This is the sliced mesh directory
+            )
 
 
 if __name__ == '__main__':
