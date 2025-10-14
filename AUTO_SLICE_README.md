@@ -187,3 +187,5 @@ Inference results:
 - **Face Assignment**: Faces are assigned to slices based on whether all vertices are within the bounding box
 - **File Format**: Sliced meshes maintain the same PLY format as the original
 
+
+

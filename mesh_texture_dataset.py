@@ -729,7 +729,16 @@ class MeshTextureDataset(Dataset):
         # print(f"Nested list labels shape: {nested_list_labels[0][0].shape}")
         # print(f"Nested list textures shape: {nested_list_textures[0][0].shape}")
         # print(f"Nested list texture masks shape: {nested_list_texture_masks[0][0].shape}")
-        return nested_list_faces, nested_list_labels, nested_list_textures, nested_list_texture_masks
+        # Build parallel nested face-id lists to map predictions/embeddings back to original face indices
+        nested_list_face_ids = []
+        for cluster in selected_clusters:
+            cluster_face_ids = []
+            for face in cluster:
+                face_idx = face_to_index[tuple(face)]
+                cluster_face_ids.append(face_idx)
+            nested_list_face_ids.append(torch.tensor(np.array(cluster_face_ids), dtype=torch.long))
+
+        return nested_list_faces, nested_list_labels, nested_list_textures, nested_list_texture_masks, nested_list_face_ids
 
 
 def texture_custom_collate_fn(batch):
@@ -738,7 +747,7 @@ def texture_custom_collate_fn(batch):
     Based on the reference implementation structure.
     
     Args:
-        batch (list): List of tuples (nested_list_faces, nested_list_labels, nested_list_textures, nested_list_texture_masks).
+        batch (list): List of tuples (nested_list_faces, nested_list_labels, nested_list_textures, nested_list_texture_masks, nested_list_face_ids).
         
     Returns:
         padded_batches (Tensor): Batched and padded face features, shape (B, P, S, F).
@@ -746,6 +755,7 @@ def texture_custom_collate_fn(batch):
         padded_textures (Tensor): Batched and padded texture sequences, shape (B, P, S, T, C).
         masks (Tensor): Mask tensor indicating valid entries, shape (B, P, S).
         texture_masks (Tensor): Texture validity masks, shape (B, P, S, T).
+        face_ids (Tensor): Original face indices per position, shape (B, P, S).
     """
     max_patch_size = max(len(item[0]) for item in batch)
     max_sequence_length = max(max(patch.size(0) for patch in item[0]) for item in batch)
@@ -757,7 +767,9 @@ def texture_custom_collate_fn(batch):
     masks = []
     texture_masks = []
 
-    for data, labels, textures, tex_masks in batch:
+    face_id_batches = []
+
+    for data, labels, textures, tex_masks, face_ids in batch:
         # Pad face features
         padded_data = [F.pad(patch, (0, 0, 0, max_sequence_length - patch.size(0))) for patch in data]
         padded_data += [torch.zeros(max_sequence_length, data[0].size(1))] * (max_patch_size - len(data))
@@ -841,6 +853,21 @@ def texture_custom_collate_fn(batch):
             padded_textures.append(torch.zeros((max_patch_size, max_sequence_length, 1, 3), dtype=torch.float32))
             texture_masks.append(torch.zeros((max_patch_size, max_sequence_length, 1), dtype=torch.bool))
 
+        # Collate face ids aligned with masks shape (P,S)
+        padded_face_ids = []
+        for face_id_list in face_ids:
+            # pad to max_sequence_length
+            pad_len = max_sequence_length - face_id_list.size(0)
+            if pad_len > 0:
+                padded = F.pad(face_id_list, (0, pad_len), value=-1)
+            else:
+                padded = face_id_list
+            padded_face_ids.append(padded)
+        # pad clusters to max_patch_size
+        while len(padded_face_ids) < max_patch_size:
+            padded_face_ids.append(torch.full((max_sequence_length,), -1, dtype=torch.long))
+        face_id_batches.append(torch.stack(padded_face_ids))
+
     final_batch = torch.stack(padded_batches)
     final_labels = torch.stack(padded_labels) 
     final_textures = torch.stack(padded_textures)
@@ -859,5 +886,6 @@ def texture_custom_collate_fn(batch):
     # print(f"  Storage size: {final_textures.storage().size()}")
     # print(f"  Element size: {final_textures.element_size()}")
     
-    return final_batch, final_labels, final_textures, final_masks, final_texture_masks
+    face_ids_tensor = torch.stack(face_id_batches)
+    return final_batch, final_labels, final_textures, final_masks, final_texture_masks, face_ids_tensor
 

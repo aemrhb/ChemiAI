@@ -1,6 +1,7 @@
 import argparse
 import os
 import yaml
+import pickle
 import torch
 import numpy as np
 import trimesh
@@ -25,7 +26,8 @@ from tools.auto_mesh_slicer import (
 
 
 def slice_large_mesh(mesh_path, output_dir, grid_divisions=(3, 3, 1), slicing_mode='grid', 
-                     target_faces_per_box=5000, min_boxes=4, max_boxes=50, save_mapping=True):
+                     target_faces_per_box=5000, min_boxes=4, max_boxes=50, save_mapping=True,
+                     texture_dir=None, texture_output_dir=None):
     """
     Slice a large mesh into smaller parts for efficient inference.
     
@@ -116,6 +118,28 @@ def slice_large_mesh(mesh_path, output_dir, grid_divisions=(3, 3, 1), slicing_mo
     print("\nWriting sliced meshes...")
     sliced_mesh_paths = []
     base_name = os.path.splitext(os.path.basename(mesh_path))[0]
+    # Texture setup (optional)
+    texture_slice_map = {}
+    original_texture_list = None
+    if texture_dir is not None:
+        # Determine texture base name (remove _labeled suffix if present)
+        texture_base_name = base_name[:-8] if base_name.endswith('_labeled') else base_name
+        candidate = os.path.join(texture_dir, texture_base_name + '.pkl')
+        candidate_alt = os.path.join(texture_dir, texture_base_name + '_pixels_test.pkl')
+        texture_path = candidate if os.path.isfile(candidate) else (candidate_alt if os.path.isfile(candidate_alt) else None)
+        if texture_path is None:
+            print(f"Warning: No texture file found for {base_name} in {texture_dir}")
+        else:
+            try:
+                with open(texture_path, 'rb') as pf:
+                    original_texture_list = pickle.load(pf)
+                # Ensure output dir for textures
+                texture_output_dir = texture_output_dir or output_dir
+                os.makedirs(texture_output_dir, exist_ok=True)
+                print(f"Loaded texture data from {texture_path} (faces: {len(original_texture_list) if isinstance(original_texture_list, list) else 'unknown'})")
+            except Exception as e:
+                print(f"Warning: Failed to load texture file {texture_path}: {e}")
+                original_texture_list = None
     
     for i, (slice_vertices, slice_faces, bbox) in enumerate(split_meshes):
         output_path = os.path.join(output_dir, f"{base_name}_slice_{i:03d}.ply")
@@ -125,6 +149,25 @@ def slice_large_mesh(mesh_path, output_dir, grid_divisions=(3, 3, 1), slicing_mo
         reduction_percent = 100.0 * (1 - len(slice_vertices) / len(vertices))
         print(f"  Slice {i:03d}: {len(slice_faces)} faces, {len(slice_vertices)} vertices "
               f"(reduced by {reduction_percent:.1f}%)")
+        # If textures are available, write per-slice texture .pkl aligned to slice face order
+        if original_texture_list is not None:
+            try:
+                # face_mappings[i] aligns with the order of faces in this slice
+                original_indices = face_mappings[i]
+                slice_textures = []
+                for idx in original_indices:
+                    # Bounds check and fallback to empty if missing
+                    if isinstance(original_texture_list, list) and 0 <= idx < len(original_texture_list):
+                        slice_textures.append(original_texture_list[idx])
+                    else:
+                        slice_textures.append((0, []))
+                tex_out_path = os.path.join(texture_output_dir or output_dir, f"{base_name}_slice_{i:03d}.pkl")
+                with open(tex_out_path, 'wb') as tf:
+                    pickle.dump(slice_textures, tf)
+                texture_slice_map[f"{base_name}_slice_{i:03d}.ply"] = os.path.basename(tex_out_path)
+                print(f"    Wrote texture slice: {tex_out_path}")
+            except Exception as e:
+                print(f"    Warning: Failed writing texture slice {i:03d}: {e}")
     
     # Save mapping file if requested
     if save_mapping:
@@ -137,6 +180,9 @@ def slice_large_mesh(mesh_path, output_dir, grid_divisions=(3, 3, 1), slicing_mo
                 for i in range(len(split_meshes))
             }
         }
+        # Include texture slice filenames if generated
+        if texture_slice_map:
+            mapping_data['texture_slices'] = texture_slice_map
         with open(mapping_path, 'w') as f:
             json.dump(mapping_data, f, indent=2)
         print(f"\nSaved face mapping to: {mapping_path}")
@@ -196,7 +242,7 @@ def process_mesh_directory_with_slicing(mesh_dir, slice_output_dir, auto_slice_c
     if slicing_mode == 'adaptive':
         # Adaptive mode parameters
         target_faces_per_box = auto_slice_config.get('target_faces_per_box', 30000)
-        min_boxes = auto_slice_config.get('min_boxes', 1)
+        min_boxes = auto_slice_config.get('min_boxes', 4)
         max_boxes = auto_slice_config.get('max_boxes', 50)
         grid_divisions = None  # Not used in adaptive mode
     else:
@@ -206,6 +252,10 @@ def process_mesh_directory_with_slicing(mesh_dir, slice_output_dir, auto_slice_c
         min_boxes = None
         max_boxes = None
     
+    # Texture slicing parameters (optional)
+    texture_dir_cfg = auto_slice_config.get('texture_dir', None)
+    texture_output_dir_cfg = auto_slice_config.get('texture_output_dir', slice_output_dir)
+
     # Slice each mesh
     all_sliced_paths = []
     for mesh_path in mesh_files:
@@ -217,14 +267,18 @@ def process_mesh_directory_with_slicing(mesh_dir, slice_output_dir, auto_slice_c
                     slicing_mode=slicing_mode,
                     target_faces_per_box=target_faces_per_box,
                     min_boxes=min_boxes,
-                    max_boxes=max_boxes
+                    max_boxes=max_boxes,
+                    texture_dir=texture_dir_cfg,
+                    texture_output_dir=texture_output_dir_cfg
                 )
             else:  # grid mode
                 sliced_paths = slice_large_mesh(
                     mesh_path=mesh_path,
                     output_dir=slice_output_dir,
                     grid_divisions=grid_divisions,
-                    slicing_mode=slicing_mode
+                    slicing_mode=slicing_mode,
+                    texture_dir=texture_dir_cfg,
+                    texture_output_dir=texture_output_dir_cfg
                 )
             all_sliced_paths.extend(sliced_paths)
         except Exception as e:
@@ -608,8 +662,8 @@ def predict(model, data_loader, num_classes, device, use_texture=False, output_d
     with torch.no_grad():
         for batch_idx, data in enumerate(data_loader):
             if use_texture:
-                # Texture dataset returns: (geometry_features, labels, texture_sequences, masks, texture_masks)
-                geometry_features, labels, texture_sequences, masks, texture_masks = data
+                # Texture dataset returns: (geometry_features, labels, texture_sequences, masks, texture_masks, face_ids_tensor)
+                geometry_features, labels, texture_sequences, masks, texture_masks, face_ids_tensor = data
                 geometry_features = geometry_features.to(device)
                 texture_sequences = texture_sequences.to(device)
                 masks = masks.to(device)
@@ -644,8 +698,19 @@ def predict(model, data_loader, num_classes, device, use_texture=False, output_d
                 if mesh_idx < len(dataset.mesh_files):
                     mesh_file = dataset.mesh_files[mesh_idx]
                     if mesh_file not in mesh_predictions:
-                        mesh_predictions[mesh_file] = []
-                    mesh_predictions[mesh_file].append(pred_np)
+                        mesh_predictions[mesh_file] = {'predictions': [], 'face_ids': []}
+                    
+                    if use_texture:
+                        # Use face_ids_tensor to map predictions back to original face indices
+                        face_ids_flat = face_ids_tensor.view(-1).to(device)
+                        face_ids_valid = face_ids_flat[valid_mask].cpu().numpy()
+                        mesh_predictions[mesh_file]['predictions'].append(pred_np)
+                        mesh_predictions[mesh_file]['face_ids'].append(face_ids_valid)
+                    else:
+                        # For geometry-only, use simple concatenation (legacy behavior)
+                        if 'predictions' not in mesh_predictions[mesh_file]:
+                            mesh_predictions[mesh_file] = []
+                        mesh_predictions[mesh_file].append(pred_np)
             
             if (batch_idx + 1) % 10 == 0:
                 print(f"Processed {batch_idx + 1} batches...")
@@ -658,9 +723,35 @@ def predict(model, data_loader, num_classes, device, use_texture=False, output_d
         os.makedirs(mesh_output_dir, exist_ok=True)
         
         print(f"\nSaving {len(mesh_predictions)} meshes with predicted labels...")
-        for mesh_file, pred_list in mesh_predictions.items():
-            # Concatenate all predictions for this mesh
-            all_preds = np.concatenate(pred_list) if len(pred_list) > 1 else pred_list[0]
+        for mesh_file, pred_data in mesh_predictions.items():
+            # Handle both old format (list) and new format (dict with face_ids)
+            if isinstance(pred_data, dict) and 'predictions' in pred_data:
+                # New format with face_ids_tensor mapping
+                pred_list = pred_data['predictions']
+                face_ids_list = pred_data['face_ids']
+                
+                # Concatenate predictions and face IDs
+                all_preds = np.concatenate(pred_list) if len(pred_list) > 1 else pred_list[0]
+                all_face_ids = np.concatenate(face_ids_list) if len(face_ids_list) > 1 else face_ids_list[0]
+                
+                # Create properly ordered predictions array
+                mesh_path = os.path.join(test_mesh_dir, mesh_file)
+                mesh = trimesh.load(mesh_path, force='mesh')
+                num_faces = mesh.faces.shape[0]
+                
+                # Initialize predictions array for all faces
+                ordered_predictions = np.zeros(num_faces, dtype=np.int32)
+                
+                # Map predictions back to correct face indices
+                for pred, face_id in zip(all_preds, all_face_ids):
+                    if 0 <= face_id < num_faces:
+                        ordered_predictions[face_id] = pred
+                
+                all_preds = ordered_predictions
+            else:
+                # Old format (geometry-only) - simple concatenation
+                pred_list = pred_data
+                all_preds = np.concatenate(pred_list) if len(pred_list) > 1 else pred_list[0]
             
             # Construct paths
             mesh_path = os.path.join(test_mesh_dir, mesh_file)
@@ -697,8 +788,8 @@ def evaluate(model, data_loader, num_classes, ignore_index, device, use_texture=
     with torch.no_grad():
         for data in data_loader:
             if use_texture:
-                # Texture dataset returns: (geometry_features, labels, texture_sequences, masks, texture_masks)
-                geometry_features, labels, texture_sequences, masks, texture_masks = data
+                # Texture dataset returns: (geometry_features, labels, texture_sequences, masks, texture_masks, face_ids_tensor)
+                geometry_features, labels, texture_sequences, masks, texture_masks, face_ids_tensor = data
                 geometry_features = geometry_features.to(device)
                 texture_sequences = texture_sequences.to(device)
                 labels = labels.to(device) +1
@@ -806,6 +897,13 @@ def main():
             print("="*60 + "\n")
         
         
+        # Determine texture directories for slicing (optional)
+        # Defaults: use test_texture_dir and write textures next to sliced meshes
+        if 'texture_dir' not in auto_slice_config and test_texture_dir is not None:
+            auto_slice_config['texture_dir'] = test_texture_dir
+        if 'texture_output_dir' not in auto_slice_config:
+            auto_slice_config['texture_output_dir'] = slice_output_dir
+
         # Process meshes with slicing
         test_mesh_dir = process_mesh_directory_with_slicing(
             mesh_dir=test_mesh_dir,
