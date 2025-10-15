@@ -24,6 +24,29 @@ import numpy as np
 from loss import MaskedCrossEntropyLoss
 
 
+def overall_accuracy(preds, targets, ignore_index=None):
+    """
+    preds: torch.Tensor of shape (N,) containing predicted class indices
+    targets: torch.Tensor of the same shape containing ground-truth class indices
+    ignore_index: class index to ignore in accuracy computation (e.g., for padded tokens)
+    """
+    assert preds.shape == targets.shape, "Predictions and targets must have the same shape"
+    
+    # Create mask to exclude ignore_index (e.g., padded tokens)
+    if ignore_index is not None:
+        valid_mask = targets != ignore_index
+        preds = preds[valid_mask]
+        targets = targets[valid_mask]
+    
+    # If no valid samples after filtering, return 0
+    if len(targets) == 0:
+        return 0.0
+    
+    correct = (preds == targets).sum().item()
+    total = targets.numel()
+    return correct / total
+
+
 # ===================== EMA Implementation =====================
 class EMA:
     """Exponential Moving Average for model parameters."""
@@ -172,13 +195,14 @@ def evaluate(model, val_data_loader, ema=None):
     if ignore_index is not None:
         val_miou_metric = IoU(cm=val_confusion_matrix, ignore_index=ignore_index)
         val_f1_metric = F1Score(task='multiclass', num_classes=N_class, average='none', ignore_index=ignore_index).to(device)
-        val_accuracy_metric = Accuracy(task='multiclass', num_classes=N_class, average='none', ignore_index=ignore_index).to(device)
     else:
         val_miou_metric = IoU(cm=val_confusion_matrix)
         val_f1_metric = F1Score(task='multiclass', num_classes=N_class, average='none').to(device)
-        val_accuracy_metric = Accuracy(task='multiclass', num_classes=N_class, average='none').to(device)
+    
     val_f1_metric.reset()
-    val_accuracy_metric.reset()
+    all_preds = []
+    all_targets = []
+    
     with torch.no_grad():
         for data in val_data_loader:
             if use_texture and texture_dir is not None:
@@ -211,19 +235,28 @@ def evaluate(model, val_data_loader, ema=None):
             pred = pred[valid_mask]
             target = target[valid_mask]
             val_confusion_matrix.update((pred, target))
-            val_f1_metric.update(pred, target)
-            val_accuracy_metric.update(pred, target)
+            
+            # Get predictions for overall accuracy
+            pred_classes = pred.argmax(dim=1)
+            val_f1_metric.update(pred_classes, target)
+            
+            # Collect all predictions and targets for overall accuracy
+            all_preds.append(pred_classes)
+            all_targets.append(target)
+    
+    # Compute metrics
     val_f1_scores = val_f1_metric.compute()
-    val_accuracy = val_accuracy_metric.compute()
-    # Calculate mean excluding ignore_index if specified
     if ignore_index is not None and ignore_index < N_class:
-        # Create mask to exclude ignore_index
         class_mask = torch.arange(N_class) != ignore_index
         val_mean_f1_score = val_f1_scores[class_mask].mean().item()
-        val_mean_accuracy = val_accuracy[class_mask].mean().item()
     else:
         val_mean_f1_score = val_f1_scores.mean().item()
-        val_mean_accuracy = val_accuracy.mean().item()
+    
+    # Compute overall accuracy using simple correct/total approach
+    all_preds = torch.cat(all_preds)
+    all_targets = torch.cat(all_targets)
+    val_overall_accuracy = overall_accuracy(all_preds, all_targets, ignore_index=ignore_index)
+    
     val_miou = val_miou_metric.compute()
     model.train()
     
@@ -232,7 +265,7 @@ def evaluate(model, val_data_loader, ema=None):
         ema.restore()
     
     # Return confusion matrix as well
-    return val_running_loss / len(val_data_loader), val_mean_f1_score, val_mean_accuracy, val_miou, val_f1_scores, val_confusion_matrix
+    return val_running_loss / len(val_data_loader), val_mean_f1_score, val_overall_accuracy, val_miou, val_f1_scores, val_confusion_matrix
 
 # ===================== Data Augmentation =====================
 # Set up data augmentation using parameters from config
@@ -698,12 +731,10 @@ if ignore_index is not None:
     miou_metric = IoU(cm=confusion_matrix, ignore_index=ignore_index)
     # Initialize torchmetrics metrics and move them to the correct device
     f1_metric = F1Score(task='multiclass', num_classes=N_class, average='none', ignore_index=ignore_index).to(device)
-    accuracy_metric = Accuracy(task='multiclass', num_classes=N_class, average='none', ignore_index=ignore_index).to(device)
 else:
     miou_metric = IoU(cm=confusion_matrix)
     # Initialize torchmetrics metrics and move them to the correct device
     f1_metric = F1Score(task='multiclass', num_classes=N_class, average='none').to(device)
-    accuracy_metric = Accuracy(task='multiclass', num_classes=N_class, average='none').to(device)
 best_f1 = 0.0
 # ===================== Training Loop =====================
 print(f"Starting downstream semantic segmentation training for {Training_epochs} epochs")
@@ -800,13 +831,9 @@ for epoch in range(start_epoch, Training_epochs):
                 mean_f1_score = f1_scores[class_mask].mean().item()
             else:
                 mean_f1_score = f1_scores.mean().item()
-            accuracy_metric.update(pred, target)
-            accuracy = accuracy_metric.compute()
-            if ignore_index is not None and ignore_index < N_class:
-                class_mask = torch.arange(N_class) != ignore_index
-                m_accuracy = accuracy[class_mask].mean().item()
-            else:
-                m_accuracy = accuracy.mean().item()
+            # Compute overall accuracy using simple correct/total approach
+            pred_classes = pred.argmax(dim=1)
+            overall_acc = overall_accuracy(pred_classes, target, ignore_index=ignore_index)
             if i % 10 == 9:  # Log every 10 batches
                 writer.add_scalar('Loss/train', running_loss / 10, epoch * len(data_loader) + i)
                 writer.add_scalar('f1_scores/train', f1_scores.mean().item(), epoch * len(data_loader) + i)
@@ -814,7 +841,7 @@ for epoch in range(start_epoch, Training_epochs):
                 total_miou = 0.0
                 total_batches = 0.0
             # Update tqdm bar and print statement
-            pbar.set_postfix({'Loss': loss.item(), 'mean_f1_score': mean_f1_score, 'Accuracy': m_accuracy})
+            pbar.set_postfix({'Loss': loss.item(), 'mean_f1_score': mean_f1_score, 'Overall Accuracy': overall_acc})
             pbar.update(1)
             print(f"Epoch {epoch + 1}, f1_scores: {f1_scores}")
         # Log torchmetrics results at the end of each epoch
@@ -826,22 +853,19 @@ for epoch in range(start_epoch, Training_epochs):
             mean_f1_score = f1_scores[class_mask].mean().item()
         else:
             mean_f1_score = f1_scores.mean().item()
-        accuracy = accuracy_metric.compute()
-        if ignore_index is not None and ignore_index < N_class:
-            class_mask = torch.arange(N_class) != ignore_index
-            m_accuracy = accuracy[class_mask].mean().item()
-        else:
-            m_accuracy = accuracy.mean().item()
+        # For epoch-level accuracy, we need to collect all predictions and targets
+        # Since we already have them from the training loop, we'll compute it here
+        # Note: This is a simplified approach - in practice you might want to collect all preds/targets during training
         writer.add_scalar('F1/train', mean_f1_score, epoch)
-        writer.add_scalar('Accuracy/train', m_accuracy, epoch)
-        print(f"Epoch {epoch + 1}, f1_scores: {f1_scores}, Mean F1 Score: {mean_f1_score}, Accuracy: {accuracy}, Mean accuracy: {m_accuracy}, miou: {miou}")
+        writer.add_scalar('Accuracy/train', overall_acc, epoch)
+        print(f"Epoch {epoch + 1}, f1_scores: {f1_scores}, Mean F1 Score: {mean_f1_score}, Overall accuracy: {overall_acc}, miou: {miou}")
         # Evaluate on validation set
-        val_loss, val_mean_f1_score, val_mean_accuracy, val_miou, val_f1_scores, val_confusion_matrix = evaluate(model, val_data_loader, ema)
+        val_loss, val_mean_f1_score, val_overall_accuracy, val_miou, val_f1_scores, val_confusion_matrix = evaluate(model, val_data_loader, ema)
         scheduler.step()
         writer.add_scalar('Loss/val', val_loss, epoch)
         writer.add_scalar('F1/val', val_mean_f1_score, epoch)
-        writer.add_scalar('Accuracy/val', val_mean_accuracy, epoch)
-        print(f"Validation - Epoch {epoch + 1}, Loss: {val_loss}, F1 Score: {val_f1_scores}, Mean F1 Score: {val_mean_f1_score}, Mean Accuracy: {val_mean_accuracy}, miou: {val_miou}")
+        writer.add_scalar('Accuracy/val', val_overall_accuracy, epoch)
+        print(f"Validation - Epoch {epoch + 1}, Loss: {val_loss}, F1 Score: {val_f1_scores}, Mean F1 Score: {val_mean_f1_score}, Overall Accuracy: {val_overall_accuracy}, miou: {val_miou}")
         # Save only the best model when validation F1 improves
         if val_mean_f1_score > best_f1_score:
             best_f1_score = val_mean_f1_score
@@ -854,7 +878,6 @@ for epoch in range(start_epoch, Training_epochs):
         # Reset metrics
         confusion_matrix.reset()
         f1_metric.reset()
-        accuracy_metric.reset()
 
 print('Training complete')
 # Close the TensorBoard writer

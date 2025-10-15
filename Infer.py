@@ -11,6 +11,29 @@ from torch.utils.data import DataLoader
 from ignite.metrics import IoU, ConfusionMatrix
 from torchmetrics import F1Score, Accuracy
 
+
+def overall_accuracy(preds, targets, ignore_index=None):
+    """
+    preds: torch.Tensor of shape (N,) containing predicted class indices
+    targets: torch.Tensor of the same shape containing ground-truth class indices
+    ignore_index: class index to ignore in accuracy computation (e.g., for padded tokens)
+    """
+    assert preds.shape == targets.shape, "Predictions and targets must have the same shape"
+    
+    # Create mask to exclude ignore_index (e.g., padded tokens)
+    if ignore_index is not None:
+        valid_mask = targets != ignore_index
+        preds = preds[valid_mask]
+        targets = targets[valid_mask]
+    
+    # If no valid samples after filtering, return 0
+    if len(targets) == 0:
+        return 0.0
+    
+    correct = (preds == targets).sum().item()
+    total = targets.numel()
+    return correct / total
+
 from mesh_dataset_2 import MeshDataset, custom_collate_fn
 from mesh_texture_dataset import MeshTextureDataset, texture_custom_collate_fn
 from model_G_2 import nomeformer
@@ -776,14 +799,14 @@ def evaluate(model, data_loader, num_classes, ignore_index, device, use_texture=
     if ignore_index is not None:
         miou_metric = IoU(cm=cm, ignore_index=ignore_index)
         f1_metric = F1Score(task='multiclass', num_classes=num_classes, average='none', ignore_index=ignore_index).to(device)
-        acc_metric = Accuracy(task='multiclass', num_classes=num_classes, average='none', ignore_index=ignore_index).to(device)
     else:
         miou_metric = IoU(cm=cm)
         f1_metric = F1Score(task='multiclass', num_classes=num_classes, average='none').to(device)
-        acc_metric = Accuracy(task='multiclass', num_classes=num_classes, average='none').to(device)
 
     f1_metric.reset()
-    acc_metric.reset()
+    
+    all_preds = []
+    all_targets = []
 
     with torch.no_grad():
         for data in data_loader:
@@ -816,23 +839,30 @@ def evaluate(model, data_loader, num_classes, ignore_index, device, use_texture=
             # ConfusionMatrix expects logits
             cm.update((pred, target))
             
-            # F1Score and Accuracy expect class indices, not logits
+            # Get predictions for overall accuracy
             pred_classes = pred.argmax(dim=1)
             f1_metric.update(pred_classes, target)
-            acc_metric.update(pred_classes, target)
+            
+            # Collect all predictions and targets for overall accuracy
+            all_preds.append(pred_classes)
+            all_targets.append(target)
 
+    # Compute metrics
     f1_scores = f1_metric.compute()
-    accuracy = acc_metric.compute()
     if ignore_index is not None and ignore_index < num_classes:
         class_mask = torch.arange(num_classes, device=f1_scores.device) != ignore_index
         mean_f1 = f1_scores[class_mask].mean().item()
-        mean_acc = accuracy[class_mask].mean().item()
     else:
         mean_f1 = f1_scores.mean().item()
-        mean_acc = accuracy.mean().item()
+    
+    # Compute overall accuracy using simple correct/total approach
+    all_preds = torch.cat(all_preds)
+    all_targets = torch.cat(all_targets)
+    overall_acc = overall_accuracy(all_preds, all_targets, ignore_index=ignore_index)
+    
     miou = miou_metric.compute()
 
-    return mean_f1, mean_acc, miou, f1_scores
+    return mean_f1, overall_acc, miou, f1_scores
 
 
 def main():
@@ -1005,11 +1035,11 @@ def main():
     # Run inference or evaluation based on mode
     if has_labels:
         # Evaluation mode - compute metrics
-        mean_f1, mean_acc, miou, f1_scores = evaluate(
+        mean_f1, overall_acc, miou, f1_scores = evaluate(
             model, data_loader, num_classes, ignore_index, device, 
             use_texture=use_texture and test_texture_dir is not None
         )
-        print(f"Evaluation Results:\n  Mean F1: {mean_f1:.4f}\n  Mean Accuracy: {mean_acc:.4f}\n  mIoU: {miou}")
+        print(f"Evaluation Results:\n  Mean F1: {mean_f1:.4f}\n  Overall Accuracy: {overall_acc:.4f}\n  mIoU: {miou}")
         print(f"Per-class F1: {f1_scores}")
     else:
         # Prediction mode - just get predictions
