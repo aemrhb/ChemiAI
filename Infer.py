@@ -992,13 +992,14 @@ def main():
     ckpt = torch.load(checkpoint_path, map_location='cpu', weights_only=True)
     current_state = model.state_dict()
     checkpoint_state = ckpt['model_state_dict']
+    total_param_tensors = len(current_state)
     matched = {k: v for k, v in checkpoint_state.items() if k in current_state and current_state[k].shape == v.shape}
     current_state.update(matched)
     model.load_state_dict(current_state, strict=False)
     
     # Report classifier restoration explicitly
     classifier_keys = [k for k in matched.keys() if k.startswith('classifier.')]
-    print(f"Restored {len(classifier_keys)} classifier params; matched {len(matched)} / {len(current_state)} total params.")
+    print(f"Restored {len(classifier_keys)} classifier params; matched {len(matched)} / {total_param_tensors} total parameter tensors.")
     model = model.to(device)
 
     # Run inference or evaluation based on mode

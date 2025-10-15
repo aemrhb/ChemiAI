@@ -78,7 +78,6 @@ class MeshTextureDataset(Dataset):
         self.label_dir = label_dir
         self.texture_dir = texture_dir
         self.json_dir = json_dir
-        self.require_labels = require_labels
         self.mesh_files = [f for f in os.listdir(mesh_dir) if f.endswith('.obj') or f.endswith('.ply')]
         self.n_clusters = n_clusters
         self.clusters_per_batch = clusters_per_batch
@@ -91,6 +90,7 @@ class MeshTextureDataset(Dataset):
         self.max_texture_pixels = max_texture_pixels
         self.coords_use_cluster_center = coords_use_cluster_center
         self.pe_bbox_normalized = pe_bbox_normalized
+        self.require_labels = require_labels
 
         # Caching setup
         self.cache_dir = os.path.join(mesh_dir, ".cluster_texture_cache")
@@ -105,10 +105,16 @@ class MeshTextureDataset(Dataset):
         if json_dir and not os.path.isdir(json_dir):
             raise FileNotFoundError(f"The json directory {json_dir} does not exist.")
 
-        # Load labels
-        self.labels = self.load_labels()
-        print(f"Found {len(self.mesh_files)} mesh files")
-        print(f"Found {len(self.labels)} label files")
+        # Load labels conditionally
+        if require_labels:
+            self.labels = self.load_labels()
+            print(f"Found {len(self.mesh_files)} mesh files")
+            print(f"Found {len(self.labels)} label files")
+        else:
+            self.labels = {}
+            print(f"Skipping label loading (prediction mode)")
+            print(f"Found {len(self.mesh_files)} mesh files")
+            print(f"Found 0 label files")
         
         # Check texture files
         self.texture_files = [f for f in os.listdir(texture_dir) if f.endswith('.pkl')]
@@ -119,11 +125,31 @@ class MeshTextureDataset(Dataset):
         for mesh_file in self.mesh_files:
             base_name = os.path.splitext(mesh_file)[0]
             texture_base_name = get_texture_base_name(base_name)
-            texture_file_path = os.path.join(texture_dir, texture_base_name + '.pkl')
-            texture_file_path_alt = os.path.join(texture_dir, texture_base_name + '_pixels_test.pkl')
+            
+            # Check in mesh directory first (for sliced meshes)
+            texture_file_path = os.path.join(self.mesh_dir, texture_base_name + '.pkl')
+            texture_file_path_alt = os.path.join(self.mesh_dir, texture_base_name + '_pixels_test.pkl')
+            
+            # If not found in mesh directory, check texture directory
+            if not (os.path.isfile(texture_file_path) or os.path.isfile(texture_file_path_alt)):
+                texture_file_path = os.path.join(texture_dir, texture_base_name + '.pkl')
+                texture_file_path_alt = os.path.join(texture_dir, texture_base_name + '_pixels_test.pkl')
+            
             if os.path.isfile(texture_file_path) or os.path.isfile(texture_file_path_alt):
                 matched_textures += 1
         print(f"Found {matched_textures} mesh files with matching texture files")
+
+    def load_labels(self):
+        """Loads the labels for each mesh file."""
+        labels = {}
+        print(f"Loading labels from {self.label_dir}...")
+        for file_name in os.listdir(self.label_dir):
+            if file_name.endswith('.txt'):
+                base_name = os.path.splitext(file_name)[0]
+                with open(os.path.join(self.label_dir, file_name), 'r') as f:
+                    labels[base_name] = [int(x) for x in f.read().split()]
+        print(f"Loaded labels for {len(labels)} files.")
+        return labels
 
     def clear_cache(self):
         """Clear both in-memory and disk caches for the dataset."""
@@ -140,24 +166,6 @@ class MeshTextureDataset(Dataset):
                 except Exception as e:
                     print(f"[CACHE] Warning: Could not remove {cache_file}: {e}")
             print(f"[CACHE] Cleared {len(cache_files)} disk cache files from {self.cache_dir}")
-        else:
-            print(f"[CACHE] No disk cache directory found at {self.cache_dir}")
-
-    def load_labels(self):
-        """Loads the labels for each mesh file."""
-        if not self.require_labels:
-            print("Skipping label loading (prediction mode)")
-            return {}
-        
-        labels = {}
-        print(f"Loading labels from {self.label_dir}...")
-        for file_name in os.listdir(self.label_dir):
-            if file_name.endswith('.txt'):
-                base_name = os.path.splitext(file_name)[0]
-                with open(os.path.join(self.label_dir, file_name), 'r') as f:
-                    labels[base_name] = [int(x) for x in f.read().split()]
-        print(f"Loaded labels for {len(labels)} files.")
-        return labels
 
     def load_texture_data(self, base_name):
         """
@@ -173,17 +181,30 @@ class MeshTextureDataset(Dataset):
         """
         # Convert mesh base name to texture base name (remove _labeled if present)
         texture_base_name = get_texture_base_name(base_name)
-        texture_file_path = os.path.join(self.texture_dir, texture_base_name + '.pkl')
+        
+        # First, try to find texture file in the same directory as the mesh files (for sliced meshes)
+        texture_file_path = os.path.join(self.mesh_dir, texture_base_name + '.pkl')
         print(f"Loading texture data from {texture_file_path}")
+        
+        # If not found in mesh directory, try the original texture directory
+        if not os.path.isfile(texture_file_path):
+            texture_file_path = os.path.join(self.texture_dir, texture_base_name + '.pkl')
+            print(f"Texture not found in mesh directory, trying {texture_file_path}")
         
         # If the standard texture file doesn't exist, try with _pixels_test suffix
         if not os.path.isfile(texture_file_path):
-            texture_file_path_alt = os.path.join(self.texture_dir, texture_base_name + '_pixels_test.pkl')
+            # Try _pixels_test suffix in mesh directory first
+            texture_file_path_alt = os.path.join(self.mesh_dir, texture_base_name + '_pixels_test.pkl')
             if os.path.isfile(texture_file_path_alt):
                 texture_file_path = texture_file_path_alt
             else:
-                print(f"Warning: No texture file found for {base_name} (tried {texture_base_name}.pkl and {texture_base_name}_pixels_test.pkl)")
-                return None, None
+                # Try _pixels_test suffix in texture directory
+                texture_file_path_alt = os.path.join(self.texture_dir, texture_base_name + '_pixels_test.pkl')
+                if os.path.isfile(texture_file_path_alt):
+                    texture_file_path = texture_file_path_alt
+                else:
+                    print(f"Warning: No texture file found for {base_name} (tried {texture_base_name}.pkl and {texture_base_name}_pixels_test.pkl in both mesh and texture directories)")
+                    return None, None
             
         try:
             with open(texture_file_path, 'rb') as f:
@@ -323,14 +344,16 @@ class MeshTextureDataset(Dataset):
         min_coords = vertices.min(axis=0)
         max_coords = vertices.max(axis=0)
         normalized_vertices = (vertices - min_coords) / (max_coords - min_coords)
-        
-        # Load labels or use dummy labels for prediction mode
         if self.require_labels:
-            face_labels = self.labels[label_file_name]
-            if len(face_labels) != len(faces):
-                raise ValueError(f"Number of labels {len(face_labels)} does not match number of faces {len(faces)} for {mesh_path}")
+            if self.require_labels:
+                face_labels = self.labels[label_file_name]
+                if len(face_labels) != len(faces):
+                    raise ValueError(f"Number of labels {len(face_labels)} does not match number of faces {len(faces)} for {mesh_path}")
+            else:
+                # In prediction mode, create dummy labels
+                face_labels = [0] * len(faces)
         else:
-            # Use dummy labels (0) for all faces in prediction mode
+            # In prediction mode, create dummy labels
             face_labels = [0] * len(faces)
 
         # Remove duplicate faces
@@ -537,9 +560,13 @@ class MeshTextureDataset(Dataset):
             min_coords = vertices.min(axis=0)
             max_coords = vertices.max(axis=0)
             normalized_vertices = (vertices - min_coords) / (max_coords - min_coords)
-            face_labels = self.labels[label_file_name]
-            if len(face_labels) != len(faces):
-                raise ValueError(f"Number of labels {len(face_labels)} does not match number of faces {len(faces)} for {mesh_path}")
+            if self.require_labels:
+                face_labels = self.labels[label_file_name]
+                if len(face_labels) != len(faces):
+                    raise ValueError(f"Number of labels {len(face_labels)} does not match number of faces {len(faces)} for {mesh_path}")
+            else:
+                # In prediction mode, create dummy labels
+                face_labels = [0] * len(faces)
 
             # Remove duplicate faces
             seen = set()
@@ -656,12 +683,14 @@ class MeshTextureDataset(Dataset):
         nested_list_labels = []
         nested_list_textures = []
         nested_list_texture_masks = []
+        nested_list_face_ids = []
         
         for cluster in selected_clusters:
             cluster_list_faces = []
             cluster_list_labels = []
             cluster_list_textures = []
             cluster_list_texture_masks = []
+            cluster_face_ids = []
             
             for face in cluster:
                 face_features = []
@@ -681,6 +710,7 @@ class MeshTextureDataset(Dataset):
                 label = face_labels[face_idx]
                 cluster_list_faces.append(face_features)
                 cluster_list_labels.append(label)
+                cluster_face_ids.append(face_idx)
                 
                 # Add texture data - convert to tensor for each face
                 cluster_list_textures.append(torch.tensor(np.array(texture_data[face_idx]), dtype=torch.uint8))
@@ -715,6 +745,7 @@ class MeshTextureDataset(Dataset):
                 
                 # Store face-level validity flags (not pixel-level masks yet)
                 nested_list_texture_masks.append(cluster_list_texture_masks)  # List of True/False values
+                nested_list_face_ids.append(torch.tensor(np.array(cluster_face_ids), dtype=torch.long))
                 
         if self.transform:
             nested_list_faces = self.transform(nested_list_faces)
@@ -729,15 +760,6 @@ class MeshTextureDataset(Dataset):
         # print(f"Nested list labels shape: {nested_list_labels[0][0].shape}")
         # print(f"Nested list textures shape: {nested_list_textures[0][0].shape}")
         # print(f"Nested list texture masks shape: {nested_list_texture_masks[0][0].shape}")
-        # Build parallel nested face-id lists to map predictions/embeddings back to original face indices
-        nested_list_face_ids = []
-        for cluster in selected_clusters:
-            cluster_face_ids = []
-            for face in cluster:
-                face_idx = face_to_index[tuple(face)]
-                cluster_face_ids.append(face_idx)
-            nested_list_face_ids.append(torch.tensor(np.array(cluster_face_ids), dtype=torch.long))
-
         return nested_list_faces, nested_list_labels, nested_list_textures, nested_list_texture_masks, nested_list_face_ids
 
 
@@ -747,7 +769,7 @@ def texture_custom_collate_fn(batch):
     Based on the reference implementation structure.
     
     Args:
-        batch (list): List of tuples (nested_list_faces, nested_list_labels, nested_list_textures, nested_list_texture_masks, nested_list_face_ids).
+        batch (list): List of tuples (nested_list_faces, nested_list_labels, nested_list_textures, nested_list_texture_masks).
         
     Returns:
         padded_batches (Tensor): Batched and padded face features, shape (B, P, S, F).
@@ -755,7 +777,6 @@ def texture_custom_collate_fn(batch):
         padded_textures (Tensor): Batched and padded texture sequences, shape (B, P, S, T, C).
         masks (Tensor): Mask tensor indicating valid entries, shape (B, P, S).
         texture_masks (Tensor): Texture validity masks, shape (B, P, S, T).
-        face_ids (Tensor): Original face indices per position, shape (B, P, S).
     """
     max_patch_size = max(len(item[0]) for item in batch)
     max_sequence_length = max(max(patch.size(0) for patch in item[0]) for item in batch)
@@ -766,7 +787,6 @@ def texture_custom_collate_fn(batch):
     padded_textures = []
     masks = []
     texture_masks = []
-
     face_id_batches = []
 
     for data, labels, textures, tex_masks, face_ids in batch:
@@ -852,20 +872,18 @@ def texture_custom_collate_fn(batch):
             # Handle case with no textures
             padded_textures.append(torch.zeros((max_patch_size, max_sequence_length, 1, 3), dtype=torch.float32))
             texture_masks.append(torch.zeros((max_patch_size, max_sequence_length, 1), dtype=torch.bool))
-
-        # Collate face ids aligned with masks shape (P,S)
+        
+        # Process face_ids
         padded_face_ids = []
         for face_id_list in face_ids:
-            # pad to max_sequence_length
-            pad_len = max_sequence_length - face_id_list.size(0)
-            if pad_len > 0:
-                padded = F.pad(face_id_list, (0, pad_len), value=-1)
-            else:
-                padded = face_id_list
-            padded_face_ids.append(padded)
-        # pad clusters to max_patch_size
+            # Pad face_ids to max_sequence_length
+            padded_face_id = F.pad(face_id_list, (0, max_sequence_length - face_id_list.size(0)), value=-1)
+            padded_face_ids.append(padded_face_id)
+        
+        # Pad to max_patch_size
         while len(padded_face_ids) < max_patch_size:
             padded_face_ids.append(torch.full((max_sequence_length,), -1, dtype=torch.long))
+        
         face_id_batches.append(torch.stack(padded_face_ids))
 
     final_batch = torch.stack(padded_batches)

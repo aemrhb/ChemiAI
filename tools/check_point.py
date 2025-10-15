@@ -196,3 +196,43 @@ def load_checkpoint(model, optimizer, checkpoint_dir):
         print(f"No checkpoint found in '{checkpoint_dir}'. Starting training from scratch.")
         return model, optimizer, 0, 0.0
 
+def save_best_checkpoint(model, optimizer, epoch, best_f1_score, checkpoint_dir, ema_state_dict=None, scheduler=None):
+    """
+    Save only the best checkpoint to a fixed filename 'best_model.pth'.
+    Overwrites the previous best to avoid accumulating multiple files.
+    """
+    if not os.path.exists(checkpoint_dir):
+        os.makedirs(checkpoint_dir)
+
+    checkpoint_path = os.path.join(checkpoint_dir, 'best_model.pth')
+
+    checkpoint_data = {
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'best_f1_score': best_f1_score
+    }
+
+    if scheduler is not None:
+        checkpoint_data['scheduler_state_dict'] = scheduler.state_dict()
+
+    if ema_state_dict is not None:
+        checkpoint_data['ema_state_dict'] = ema_state_dict
+
+    torch.save(checkpoint_data, checkpoint_path)
+
+def load_best_checkpoint_if_exists(model, optimizer, checkpoint_dir):
+    """
+    Load 'best_model.pth' if present. Returns (model, optimizer, epoch, best_f1_score) or None if missing.
+    """
+    best_path = os.path.join(checkpoint_dir, 'best_model.pth')
+    if os.path.exists(best_path):
+        checkpoint = torch.load(best_path, map_location="cpu")
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        epoch = checkpoint['epoch']
+        best_f1_score = checkpoint['best_f1_score']
+        print(f"Best checkpoint loaded from '{best_path}' at epoch {epoch} with best F1 score {best_f1_score}.")
+        return model, optimizer, epoch, best_f1_score
+    return None
+

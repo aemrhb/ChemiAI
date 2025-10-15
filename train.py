@@ -12,7 +12,7 @@ from model_G_2 import nomeformer
 from tools.downst import DownstreamClassifier
 from integrated_texture_geometry_model import IntegratedTextureGeometryModel, IntegratedDownstreamClassifier
 from tools.helper import init_opt
-from tools.check_point import save_checkpoint , load_checkpoint
+from tools.check_point import save_checkpoint , load_checkpoint, save_best_checkpoint, load_best_checkpoint_if_exists
 from tqdm import tqdm
 import os
 from ignite.metrics import IoU, ConfusionMatrix  # Metrics for evaluation
@@ -671,78 +671,26 @@ writer = SummaryWriter(log_dir=log_dir)
 # Initialize variables for checkpoint tracking
 best_f1 = 0.0
 
-# Find the latest checkpoint file
-import re
-checkpoint_pattern = re.compile(r'checkpoint_epoch(\d+)_f1_(\d+\.\d+).pth')
-checkpoints = []
-
-if os.path.exists(checkpoint_dir):
-    for filename in os.listdir(checkpoint_dir):
-        match = checkpoint_pattern.match(filename)
-        if match:
-            epoch = int(match.group(1))
-            f1_score = float(match.group(2))
-            checkpoints.append((epoch, f1_score, filename))
-
-if checkpoints:
-    # Sort by epoch and f1_score in descending order
-    checkpoints.sort(key=lambda x: (x[0], x[1]), reverse=True)
-    latest_checkpoint = checkpoints[0][2]
-    checkpoint_path = os.path.join(checkpoint_dir, latest_checkpoint)
-    print(f"Found latest checkpoint: {checkpoint_path}")
-else:
-    checkpoint_path = os.path.join(checkpoint_dir, 'best_downstream_model.pth')
-    print(f"No checkpoint files found, will look for: {checkpoint_path}")
-
-# Load checkpoint if resuming
-if resume and os.path.exists(checkpoint_path):
-    print(f"Found checkpoint at {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    print(f"Checkpoint keys: {list(checkpoint.keys())}")
-    
-    model.load_state_dict(checkpoint['model_state_dict'])
-    
-    # Try to load optimizer state, but handle mismatched parameter groups
-    try:
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        print("Successfully loaded optimizer state")
-    except ValueError as e:
-        print(f"WARNING: Could not load optimizer state due to parameter group mismatch: {e}")
-        print("Continuing with a fresh optimizer state")
-    
-    # Try to load scheduler state
-    try:
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        print("Successfully loaded scheduler state")
-    except Exception as e:
-        print(f"WARNING: Could not load scheduler state: {e}")
-        print("Continuing with a fresh scheduler state")
-    
-    # Check if epoch key exists in checkpoint
-    if 'epoch' in checkpoint:
-        start_epoch = checkpoint['epoch']
-        print(f"Found epoch in checkpoint: {start_epoch}")
+start_epoch = 0
+if resume:
+    loaded = load_best_checkpoint_if_exists(model, optimizer, checkpoint_dir)
+    if loaded is not None:
+        model, optimizer, start_epoch, best_f1 = loaded
+        # Try to load scheduler state from best checkpoint as well
+        best_path = os.path.join(checkpoint_dir, 'best_model.pth')
+        try:
+            checkpoint = torch.load(best_path, map_location=device)
+            if 'scheduler_state_dict' in checkpoint:
+                scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                print("Successfully loaded scheduler state from best checkpoint")
+            if use_ema and 'ema_state_dict' in checkpoint:
+                ema.load_state_dict(checkpoint['ema_state_dict'])
+                print("Loaded EMA state from best checkpoint")
+        except Exception as e:
+            print(f"WARNING: Could not load scheduler/EMA from best checkpoint: {e}")
+        print(f"Resuming from epoch {start_epoch} with best F1 {best_f1:.4f}")
     else:
-        print("WARNING: No 'epoch' key found in checkpoint, starting from epoch 0")
-        start_epoch = 0
-    
-    if 'best_f1_score' in checkpoint:
-        best_f1 = checkpoint['best_f1_score']
-        print(f"Found best_f1_score in checkpoint: {best_f1}")
-    else:
-        print("WARNING: No 'best_f1_score' key found in checkpoint, setting to 0.0")
-        best_f1 = 0.0
-    
-    # Load EMA state if available
-    if use_ema and 'ema_state_dict' in checkpoint:
-        ema.load_state_dict(checkpoint['ema_state_dict'])
-        print("Loaded EMA state from checkpoint")
-    
-    print(f"Resuming from epoch {start_epoch} with best F1 {best_f1:.4f}")
-else:
-    if resume:
-        print(f"WARNING: Resume is True but checkpoint not found at {checkpoint_path}")
-    start_epoch = 0
+        print("No best checkpoint found; starting from scratch.")
 best_f1_score = 0
 # Initialize Ignite metrics
 confusion_matrix = ConfusionMatrix(num_classes=N_class)
@@ -894,21 +842,15 @@ for epoch in range(start_epoch, Training_epochs):
         writer.add_scalar('F1/val', val_mean_f1_score, epoch)
         writer.add_scalar('Accuracy/val', val_mean_accuracy, epoch)
         print(f"Validation - Epoch {epoch + 1}, Loss: {val_loss}, F1 Score: {val_f1_scores}, Mean F1 Score: {val_mean_f1_score}, Mean Accuracy: {val_mean_accuracy}, miou: {val_miou}")
-        # Save the model checkpoint if the validation F1 score improves
+        # Save only the best model when validation F1 improves
         if val_mean_f1_score > best_f1_score:
             best_f1_score = val_mean_f1_score
-            # Save checkpoint with EMA state if available
             if ema is not None:
-                save_checkpoint(model, optimizer, epoch, best_f1_score, checkpoint_dir, ema_state_dict=ema.state_dict(), scheduler=scheduler)
+                save_best_checkpoint(model, optimizer, epoch, best_f1_score, checkpoint_dir, ema_state_dict=ema.state_dict(), scheduler=scheduler)
             else:
-                save_checkpoint(model, optimizer, epoch, best_f1_score, checkpoint_dir, scheduler=scheduler)
-            print(f"New best validation F1 score: {best_f1_score}. Checkpoint saved.")
-            # Print the confusion matrix when best validation happens
+                save_best_checkpoint(model, optimizer, epoch, best_f1_score, checkpoint_dir, scheduler=scheduler)
+            print(f"New best validation F1 score: {best_f1_score}. Best checkpoint saved (best_model.pth).")
             print(f"Confusion Matrix at Best Validation:\n{val_confusion_matrix.compute()}")
-            
-            # Update checkpoint path for next iteration
-            checkpoint_filename = f'checkpoint_epoch{epoch}_f1_{best_f1_score:.4f}.pth'
-            checkpoint_path = os.path.join(checkpoint_dir, checkpoint_filename)
         # Reset metrics
         confusion_matrix.reset()
         f1_metric.reset()
